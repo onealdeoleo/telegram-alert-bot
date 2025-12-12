@@ -158,7 +158,7 @@ def main():
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("remove", remove))
 
-    app.job_queue.run_repeating(check_job, interval=15 * 60, first=10)
+    app.job_queue.run_repeating(check_job, interval=5 * 60, first=10)
     app.run_polling()
 
 
