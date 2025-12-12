@@ -1,5 +1,4 @@
 import os, json, time
-from datetime import datetime, timezone
 
 import yfinance as yf
 from telegram import Update
@@ -8,7 +7,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 DATA_FILE = "alerts.json"
 
 
-# --------- helpers ---------
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {"users": {}}
@@ -42,7 +40,6 @@ def pct_drop_from_high(price: float, recent_high: float) -> float:
     return (recent_high - price) / recent_high * 100.0
 
 
-# --------- commands ---------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "✅ Bot de alertas activo.\n\n"
@@ -104,7 +101,6 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ese ticker no estaba en tu lista. Usa /list")
 
 
-# --------- background checker ---------
 async def check_alerts(app: Application):
     data = load_data()
     users = data.get("users", {})
@@ -121,7 +117,6 @@ async def check_alerts(app: Application):
             pct_target = float(cfg.get("pct", 10))
             last_sent = int(cfg.get("last_sent_ts", 0))
 
-            # cooldown (para no spamear)
             if time.time() - last_sent < cooldown_sec:
                 continue
 
@@ -163,9 +158,7 @@ def main():
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("remove", remove))
 
-    # ✅ Revisión automática cada 15 minutos (primera revisión a los 10 segundos)
     app.job_queue.run_repeating(check_job, interval=15 * 60, first=10)
-
     app.run_polling()
 
 
