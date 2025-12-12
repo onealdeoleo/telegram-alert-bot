@@ -1,12 +1,12 @@
 import os, json, time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 DATA_FILE = "alerts.json"
+
 
 # --------- helpers ---------
 def load_data():
@@ -15,21 +15,16 @@ def load_data():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def get_user(data, chat_id: str):
     users = data.setdefault("users", {})
     return users.setdefault(chat_id, {"alerts": {}, "cooldown_min": 360})
 
-def is_market_hours_est():
-    # Aproximado: Lun–Vie 9:30–16:00 ET.
-    # (Suficiente para un bot simple; si quieres precisión por feriados lo mejor es un calendario de mercado.)
-    now_utc = datetime.now(timezone.utc)
-    # ET ~ UTC-5 / UTC-4 por DST; esto es aproximación simple:
-    # para evitar líos: revisamos todo el día y listo, pero con menos frecuencia.
-    return True
 
 async def fetch_price_and_recent_high(ticker: str, lookback_days: int = 60):
     t = yf.Ticker(ticker)
@@ -40,10 +35,12 @@ async def fetch_price_and_recent_high(ticker: str, lookback_days: int = 60):
     recent_high = float(hist["Close"].max())
     return close, recent_high
 
+
 def pct_drop_from_high(price: float, recent_high: float) -> float:
     if recent_high <= 0:
         return 0.0
     return (recent_high - price) / recent_high * 100.0
+
 
 # --------- commands ---------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,9 +54,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
+
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         return await update.message.reply_text("Uso: /add TICKER %  (ej: /add NVDA 15)")
+
     ticker = context.args[0].upper().strip()
     try:
         pct = float(context.args[1])
@@ -75,28 +74,35 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Alerta creada: {ticker} caída ≥ {pct:.1f}% desde el máximo reciente.")
 
+
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     u = get_user(data, str(update.effective_chat.id))
     alerts = u.get("alerts", {})
     if not alerts:
         return await update.message.reply_text("No tienes alertas. Usa /add QQQ 10")
+
     lines = ["📌 Tus alertas:"]
     for tkr, cfg in alerts.items():
         lines.append(f"• {tkr}: caída ≥ {cfg['pct']}%")
     await update.message.reply_text("\n".join(lines))
 
+
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1:
         return await update.message.reply_text("Uso: /remove TICKER  (ej: /remove QQQ)")
+
     ticker = context.args[0].upper().strip()
     data = load_data()
     u = get_user(data, str(update.effective_chat.id))
+
     if ticker in u["alerts"]:
         del u["alerts"][ticker]
         save_data(data)
         return await update.message.reply_text(f"🗑️ Alerta eliminada: {ticker}")
+
     await update.message.reply_text("Ese ticker no estaba en tu lista. Usa /list")
+
 
 # --------- background checker ---------
 async def check_alerts(app: Application):
@@ -140,9 +146,10 @@ async def check_alerts(app: Application):
                     )
                 )
 
-async def run_checker(context: ContextTypes.DEFAULT_TYPE):
-    # wrapper para scheduler
+
+async def check_job(context: ContextTypes.DEFAULT_TYPE):
     await check_alerts(context.application)
+
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -156,12 +163,11 @@ def main():
     app.add_handler(CommandHandler("list", list_alerts))
     app.add_handler(CommandHandler("remove", remove))
 
-    scheduler = AsyncIOScheduler()
-    # revisa cada 15 minutos (puedes cambiarlo a 5, 10, 30)
-    scheduler.add_job(lambda: app.create_task(check_alerts(app)), "interval", minutes=15)
-    scheduler.start()
+    # ✅ Revisión automática cada 15 minutos (primera revisión a los 10 segundos)
+    app.job_queue.run_repeating(check_job, interval=15 * 60, first=10)
 
-    app.run_polling(close_loop=False)
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
