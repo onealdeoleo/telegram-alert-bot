@@ -1,266 +1,214 @@
 import os
 import json
-import time
-from dataclasses import dataclass
+import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, List, Tuple
 
-import pandas as pd
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 import yfinance as yf
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-DATA_FILE = "alerts.json"
+# =========================
+# ENV VARS (Render)
+# =========================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-
-# ----------------------------
-# Storage helpers
-# ----------------------------
-def load_data() -> Dict[str, Any]:
-    if not os.path.exists(DATA_FILE):
-        return {"users": {}}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"users": {}}
-
-
-def save_data(data: Dict[str, Any]) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def now_ts() -> int:
-    return int(time.time())
+# =========================
+# DB HELPERS
+# =========================
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Falta DATABASE_URL en Render (Environment Variables).")
+    # sslmode=require funciona bien en Render Postgres
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, sslmode="require")
 
 
-def monday_of_week(dt: datetime) -> datetime:
-    start = dt - timedelta(days=dt.weekday())
-    return start.replace(hour=0, minute=0, second=0, microsecond=0)
+def db_init():
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                username TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                drop_pct NUMERIC,          -- /add TICKER 10
+                entry_price NUMERIC,       -- /entry TICKER 175
+                tp_pct NUMERIC,            -- /setsell TICKER 20 10
+                sl_pct NUMERIC,
+                dca_rules JSONB,           -- /dca TICKER 10:15 15:25 ...
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(telegram_id, ticker)
+            );
+            """)
+
+            # anti-spam columns
+            cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_buy_alert_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_tp_alert_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_sl_alert_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS last_buy_drop_sent NUMERIC;")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                telegram_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                weekly_budget NUMERIC DEFAULT 0,
+                dips_budget NUMERIC DEFAULT 0,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS plans (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
+                ticker TEXT NOT NULL,
+                amount NUMERIC NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """)
+
+            conn.commit()
 
 
-def get_user(data: Dict[str, Any], chat_id: str) -> Dict[str, Any]:
-    users = data.setdefault("users", {})
-    u = users.setdefault(chat_id, {})
-    u.setdefault("alerts", {})              # ticker -> cfg
-    u.setdefault("cooldown_min", 360)       # min cooldown per ticker alert
-    u.setdefault("weekly_budget", 70)       # fixed Monday money (manual)
-    u.setdefault("dip_budget", 40)          # extra dips money (smart)
-    u.setdefault("weekly_plan", {})         # ticker -> dollars (Monday plan)
-    u.setdefault("week_state", {"week_monday_ts": 0, "dip_spent": 0, "weekly_spent": 0})
-    u.setdefault("trial", {"start_ts": 0, "days": 7})
-    u.setdefault("premium", {"enabled": False, "until_ts": 0})
-    return u
+def upsert_user(update: Update):
+    tg_id = update.effective_user.id
+    username = update.effective_user.username
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO users (telegram_id, username)
+            VALUES (%s, %s)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET username = EXCLUDED.username;
+            """, (tg_id, username))
+            conn.commit()
 
 
-# ----------------------------
-# Premium / Trial
-# ----------------------------
-def is_admin(chat_id: str) -> bool:
-    raw = os.getenv("ADMIN_CHAT_IDS", "").strip()
-    if not raw:
-        return False
-    admins = {x.strip() for x in raw.split(",") if x.strip()}
-    return chat_id in admins
+def normalize_ticker(t: str) -> str:
+    return (t or "").strip().upper()
 
 
-def premium_active(u: Dict[str, Any]) -> bool:
-    prem = u.get("premium", {})
-    if prem.get("enabled") and int(prem.get("until_ts", 0) or 0) > now_ts():
-        return True
-
-    trial = u.get("trial", {"start_ts": 0, "days": 7})
-    start = int(trial.get("start_ts", 0) or 0)
-    days = int(trial.get("days", 7) or 7)
-    if start <= 0:
-        return False
-    return now_ts() < start + days * 86400
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
-def ensure_trial(u: Dict[str, Any]) -> None:
-    trial = u.get("trial", {})
-    if int(trial.get("start_ts", 0) or 0) <= 0:
-        trial["start_ts"] = now_ts()
-        trial.setdefault("days", 7)
-        u["trial"] = trial
+# =========================
+# PRICE HELPERS (yfinance)
+# =========================
+def fetch_price_and_60d_high(ticker: str):
+    """
+    Returns: (current_price, high_60d)
+    Uses yfinance history. (Simple + reliable)
+    """
+    tk = yf.Ticker(ticker)
 
-
-def free_limits_ok(u: Dict[str, Any]) -> Tuple[bool, str]:
-    # FREE: max 2 tickers
-    if premium_active(u):
-        return True, ""
-    if len(u.get("alerts", {})) >= 2:
-        return False, "⚠️ En FREE solo puedes tener 2 tickers. Para más: /premium"
-    return True, ""
-
-
-# ----------------------------
-# Week reset (IMPORTANT)
-# ----------------------------
-def ensure_week_reset(u: Dict[str, Any]) -> None:
-    ws = u.get("week_state", {"week_monday_ts": 0, "dip_spent": 0, "weekly_spent": 0})
-    current_monday = int(monday_of_week(datetime.now(timezone.utc)).timestamp())
-
-    if int(ws.get("week_monday_ts", 0) or 0) != current_monday:
-        ws["week_monday_ts"] = current_monday
-        ws["dip_spent"] = 0
-        ws["weekly_spent"] = 0
-
-    ws.setdefault("dip_spent", 0)
-    ws.setdefault("weekly_spent", 0)
-    u["week_state"] = ws
-
-
-# ----------------------------
-# Market data + indicators
-# ----------------------------
-def safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def compute_rsi(series: pd.Series, period: int = 14) -> Optional[float]:
-    if series is None or len(series) < period + 2:
-        return None
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    val = rsi.iloc[-1]
-    return None if pd.isna(val) else float(val)
-
-
-@dataclass
-class Snapshot:
-    price: float
-    recent_high: float
-    drop_pct: float
-    sma50: Optional[float]
-    sma200: Optional[float]
-    rsi14: Optional[float]
-    vol_ratio: Optional[float]  # last vol / avg20 vol
-
-
-def fetch_snapshot(ticker: str, lookback_days: int = 220) -> Optional[Snapshot]:
-    t = yf.Ticker(ticker)
-    hist = t.history(period=f"{lookback_days}d", interval="1d")
+    # last ~3 months is enough to compute 60 trading days
+    hist = tk.history(period="3mo", interval="1d")
     if hist is None or hist.empty:
-        return None
+        return None, None
 
-    close = hist["Close"].dropna()
-    if close.empty:
-        return None
+    # current price: last Close
+    current = float(hist["Close"].iloc[-1])
 
-    price = float(close.iloc[-1])
-    recent = hist.tail(60)["Close"].dropna()
-    recent_high = float(recent.max()) if not recent.empty else float(close.max())
-    drop_pct = ((recent_high - price) / recent_high * 100.0) if recent_high > 0 else 0.0
+    # 60-day high: max of last ~60 rows (if fewer, use all)
+    tail = hist.tail(60)
+    high_60d = float(tail["High"].max())
 
-    sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
-    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
-    rsi14 = compute_rsi(close, 14)
-
-    vol = hist["Volume"].dropna()
-    vol_ratio = None
-    if len(vol) >= 21:
-        avg20 = float(vol.tail(21).head(20).mean())
-        lastv = float(vol.iloc[-1])
-        if avg20 > 0:
-            vol_ratio = lastv / avg20
-
-    return Snapshot(
-        price=price,
-        recent_high=recent_high,
-        drop_pct=drop_pct,
-        sma50=sma50,
-        sma200=sma200,
-        rsi14=rsi14,
-        vol_ratio=vol_ratio,
-    )
+    return current, high_60d
 
 
-def opportunity_score(s: Snapshot) -> float:
-    score = 0.0
-
-    # drop (0..25%) -> up to 4 pts
-    score += min(max(s.drop_pct, 0.0), 25.0) / 25.0 * 4.0
-
-    # RSI
-    if s.rsi14 is not None:
-        if s.rsi14 <= 30:
-            score += 2.5
-        elif s.rsi14 <= 40:
-            score += 1.8
-        elif s.rsi14 <= 50:
-            score += 1.0
-
-    # SMA50
-    if s.sma50 is not None and s.sma50 > 0:
-        score += 1.5 if s.price < s.sma50 else 0.5
-
-    # Volume ratio
-    if s.vol_ratio is not None:
-        if s.vol_ratio >= 1.5:
-            score += 1.2
-        elif s.vol_ratio >= 1.1:
-            score += 0.7
-
-    # SMA200 (trend)
-    if s.sma200 is not None and s.sma200 > 0:
-        score -= 0.8 if s.price < s.sma200 else -0.4  # (below penalize, above bonus)
-
-    return float(max(0.0, min(10.0, score)))
+# =========================
+# FORMATTERS
+# =========================
+def fmt_money(x):
+    if x is None:
+        return "None"
+    try:
+        return f"{float(x):,.2f}"
+    except:
+        return str(x)
 
 
-# ----------------------------
-# DCA parsing
-# ----------------------------
-def parse_dca(dca_str: str) -> List[Tuple[float, float]]:
-    tiers: List[Tuple[float, float]] = []
-    if not dca_str:
-        return tiers
-    for p in dca_str.split():
-        if ":" not in p:
+def fmt_pct(x):
+    if x is None:
+        return "None"
+    try:
+        return f"{float(x):.1f}%"
+    except:
+        return str(x)
+
+
+def parse_dca_rules(parts):
+    """
+    Input: ["10:15","15:25","20:40"] -> list of dicts sorted by drop asc
+    Each is {"drop":10.0, "amount":15.0}
+    """
+    rules = []
+    for p in parts:
+        p = p.strip()
+        if not p or ":" not in p:
             continue
         a, b = p.split(":", 1)
-        drop = safe_float(a)
-        amt = safe_float(b)
-        if drop is None or amt is None:
-            continue
-        if drop <= 0 or amt <= 0:
-            continue
-        tiers.append((drop, amt))
-    tiers.sort(key=lambda x: x[0])
-    return tiers
+        drop = float(a)
+        amt = float(b)
+        rules.append({"drop": drop, "amount": amt})
+    rules.sort(key=lambda r: r["drop"])
+    return rules
 
 
-def dca_suggestion(drop_pct: float, tiers: List[Tuple[float, float]]) -> Optional[float]:
-    amt = None
-    for d, a in tiers:
-        if drop_pct >= d:
-            amt = a
-    return amt
+def dca_suggest_amount(dca_rules, drop_pct, dips_budget):
+    """
+    If drop >= rule.drop => candidate amount
+    Return the highest matched rule amount, capped by dips_budget (if dips_budget>0)
+    """
+    if not dca_rules or drop_pct is None:
+        return None
+    best = None
+    for r in dca_rules:
+        if drop_pct >= float(r["drop"]):
+            best = float(r["amount"])
+    if best is None:
+        return None
+    if dips_budget is not None and float(dips_budget) > 0:
+        return float(min(best, float(dips_budget)))
+    return best
 
 
-# ----------------------------
-# Commands
-# ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    ensure_week_reset(u)
-    save_data(data)
+# =========================
+# COMMANDS
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ticker FROM alerts WHERE telegram_id=%s ORDER BY ticker;", (tg_id,))
+            tickers = [r["ticker"] for r in cur.fetchall()]
+
+    if tickers:
+        tracked = ", ".join(tickers)
+    else:
+        tracked = "(ninguno todavía)"
 
     msg = (
         "✅ Bot activo.\n\n"
+        f"📌 Tickers en seguimiento: {tracked}\n\n"
         "📌 Ver todo: /list\n"
         "📌 Ver detalle: /show TICKER\n\n"
         "🟦 BUY por caída desde máximo 60d:\n"
@@ -269,644 +217,450 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /entry QQQ 450\n\n"
         "🧾 Reglas TP/SL (solo alerta, NO opera):\n"
         "  /setsell QQQ 10 7\n\n"
-        "🧠 DCA inteligente:\n"
-        "  /dca QQQ 10:15 15:25\n\n"
+        "🧠 DCA inteligente (cuánto comprar según caída):\n"
+        "  /dca QQQ 10:15 15:25 20:40\n\n"
         "💰 Presupuesto:\n"
-        "  /setbudget 70 40\n"
-        "  /plan QQQ 30 SCHD 20 JEPQ 20\n"
-        "  /monday\n\n"
-        "✅ Confirmar compras (para contar presupuesto):\n"
-        "  /bought dips NVDA 15\n"
-        "  /bought weekly QQQ 30\n"
-        "  /bought status\n"
-        "  /bought reset\n\n"
-        "📊 Score (Premium/Trial):\n"
-        "  /score QQQ\n\n"
-        "📦 Copy strategies (Premium/Trial):\n"
-        "  /copy aggressive | income | conservative\n\n"
-        "💎 Premium/Trial:\n"
-        "  /premium\n\n"
+        "  /setbudget 70 40   (semanal / dips)\n"
+        "  /plan QQQ 30 SCHD 20 JEPQ 20  (plan fijo lunes)\n"
+        "  /monday  (ver plan)\n\n"
         "⚠️ Nota: este bot solo envía alertas/sugerencias. Tú decides comprar/vender."
     )
-
-    alerts = u.get("alerts", {})
-    ws = u.get("week_state", {})
-    weekly_budget = float(u.get("weekly_budget", 70))
-    dip_budget = float(u.get("dip_budget", 40))
-    weekly_spent = float(ws.get("weekly_spent", 0))
-    dip_spent = float(ws.get("dip_spent", 0))
-
-    if alerts:
-        lines = ["\n\n📍 Tus tickers activos ahora:"]
-        for tkr, cfg in alerts.items():
-            buy = cfg.get("buy_drop_pct", None)
-            entryv = cfg.get("entry", None)
-            tp = cfg.get("tp", None)
-            sl = cfg.get("sl", None)
-            dca_str = cfg.get("dca", "")
-            dca_on = "ON" if dca_str else "OFF"
-            lines.append(
-                f"• {tkr} | BUY≥{buy}% | Entry:{entryv} | TP:{tp}% SL:{sl}% | DCA:{dca_on}"
-            )
-        lines.append(f"\n💰 Weekly usado: ${weekly_spent:.0f}/${weekly_budget:.0f}")
-        lines.append(f"💰 Dips usado: ${dip_spent:.0f}/${dip_budget:.0f}")
-        msg += "\n".join(lines)
-    else:
-        msg += "\n\n📍 No tienes tickers activos aún. Ej: /add QQQ 10"
-
     await update.message.reply_text(msg)
 
 
-async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    save_data(data)
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
 
-    if premium_active(u):
-        prem = u.get("premium", {})
-        until = int(prem.get("until_ts", 0) or 0)
-        if until > now_ts():
-            dt = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            await update.message.reply_text(f"💎 Premium activo hasta: {dt}")
-        else:
-            await update.message.reply_text("🆓 Estás en TRIAL/Premium activo.")
+    if len(context.args) < 2:
+        return await update.message.reply_text("Uso: /add TICKER DROP%\nEj: /add QQQ 10")
+
+    ticker = normalize_ticker(context.args[0])
+    drop = float(context.args[1])
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO alerts (telegram_id, ticker, drop_pct)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (telegram_id, ticker)
+            DO UPDATE SET drop_pct = EXCLUDED.drop_pct;
+            """, (tg_id, ticker, drop))
+            conn.commit()
+
+    await update.message.reply_text(f"✅ BUY creado: {ticker} ≥ {drop:.1f}% (caída desde máximo 60d)")
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    if len(context.args) < 1:
+        return await update.message.reply_text("Uso: /remove TICKER\nEj: /remove QQQ")
+
+    ticker = normalize_ticker(context.args[0])
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM alerts WHERE telegram_id=%s AND ticker=%s;", (tg_id, ticker))
+            conn.commit()
+
+    await update.message.reply_text(f"🗑️ Eliminado: {ticker}")
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT ticker, drop_pct
+            FROM alerts
+            WHERE telegram_id=%s
+            ORDER BY ticker;
+            """, (tg_id,))
+            rows = cur.fetchall()
+
+    if not rows:
+        return await update.message.reply_text("No tienes alertas. Usa /add TICKER %  (ej: /add QQQ 10)")
+
+    lines = ["📌 Tus alertas:"]
+    for r in rows:
+        lines.append(f"• {r['ticker']}: caída ≥ {fmt_pct(r['drop_pct'])}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    if len(context.args) < 1:
+        return await update.message.reply_text("Uso: /show TICKER\nEj: /show QQQ")
+
+    ticker = normalize_ticker(context.args[0])
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT ticker, drop_pct, entry_price, tp_pct, sl_pct, dca_rules
+            FROM alerts
+            WHERE telegram_id=%s AND ticker=%s;
+            """, (tg_id, ticker))
+            a = cur.fetchone()
+
+    if not a:
+        return await update.message.reply_text(f"No encuentro {ticker}. Crea primero con /add {ticker} 10")
+
+    dca = a["dca_rules"] or []
+    dca_lines = []
+    if dca:
+        dca_lines.append("DCA:")
+        for r in dca:
+            dca_lines.append(f"≥{r['drop']}% → ${fmt_money(r['amount'])}")
     else:
-        await update.message.reply_text("🆓 Estás en FREE. Límite 2 tickers. (Trial puede expirar).")
+        dca_lines.append("DCA: (none)")
+
+    msg = (
+        f"{ticker}\n"
+        f"BUY ≥ {fmt_pct(a['drop_pct'])}\n"
+        f"Entry: {fmt_money(a['entry_price'])}\n"
+        f"TP: {fmt_pct(a['tp_pct'])}\n"
+        f"SL: {fmt_pct(a['sl_pct'])}\n"
+        + "\n".join(dca_lines)
+    )
+    await update.message.reply_text(msg)
 
 
-async def grantpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if not is_admin(chat_id):
-        return await update.message.reply_text("⛔ Solo admin.")
+async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
     if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /grantpremium CHAT_ID DAYS")
+        return await update.message.reply_text("Uso: /entry TICKER PRICE\nEj: /entry QQQ 450")
 
-    target = context.args[0].strip()
-    days = safe_float(context.args[1])
-    if days is None or days <= 0:
-        return await update.message.reply_text("DAYS inválido.")
+    ticker = normalize_ticker(context.args[0])
+    price = float(context.args[1])
 
-    data = load_data()
-    u = get_user(data, target)
-    u["premium"] = {"enabled": True, "until_ts": now_ts() + int(days * 86400)}
-    save_data(data)
-    await update.message.reply_text(f"✅ Premium activado para {target} por {int(days)} días.")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO alerts (telegram_id, ticker, entry_price)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (telegram_id, ticker)
+            DO UPDATE SET entry_price = EXCLUDED.entry_price;
+            """, (tg_id, ticker, price))
+            conn.commit()
 
-
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /add TICKER %   (ej: /add QQQ 10)")
-    ticker = context.args[0].upper().strip()
-    pct = safe_float(context.args[1])
-    if pct is None or pct <= 0 or pct > 80:
-        return await update.message.reply_text("El % debe ser válido (ej: 10, 15).")
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    ok, msg = free_limits_ok(u)
-    if not ok:
-        return await update.message.reply_text(msg)
-
-    cfg = u["alerts"].setdefault(ticker, {})
-    cfg.setdefault("entry", None)
-    cfg.setdefault("tp", 0)
-    cfg.setdefault("sl", 0)
-    cfg.setdefault("dca", "")
-    cfg.setdefault("last_sent_ts", 0)
-    cfg.setdefault("last_dca_sent_week", 0)
-
-    cfg["buy_drop_pct"] = float(pct)
-    save_data(data)
-    await update.message.reply_text(f"✅ BUY creado: {ticker} caída ≥ {pct:.1f}% (desde máximo 60d).")
-
-
-async def setsell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 3:
-        return await update.message.reply_text("Uso: /setsell TICKER TP% SL%   (ej: /setsell QQQ 10 7)")
-    ticker = context.args[0].upper().strip()
-    tp = safe_float(context.args[1])
-    sl = safe_float(context.args[2])
-    if tp is None or sl is None or tp <= 0 or sl <= 0:
-        return await update.message.reply_text("TP y SL deben ser números > 0.")
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    cfg = u["alerts"].setdefault(ticker, {})
-    cfg["tp"] = float(tp)
-    cfg["sl"] = float(sl)
-    save_data(data)
-    await update.message.reply_text(f"✅ Reglas guardadas {ticker}: TP {tp:.1f}% / SL {sl:.1f}%.")
-
-
-async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /entry TICKER PRICE   (ej: /entry NVDA 175)")
-    ticker = context.args[0].upper().strip()
-    price = safe_float(context.args[1])
-    if price is None or price <= 0:
-        return await update.message.reply_text("PRICE inválido.")
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    cfg = u["alerts"].setdefault(ticker, {})
-    cfg["entry"] = float(price)
-    save_data(data)
     await update.message.reply_text(f"📌 Entry guardado {ticker} @ ${price:.2f}")
 
 
-async def dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /dca TICKER 10:15 15:25 ...")
-    ticker = context.args[0].upper().strip()
-    dca_str = " ".join(context.args[1:]).strip()
-    tiers = parse_dca(dca_str)
-    if not tiers:
-        return await update.message.reply_text("Formato inválido. Ej: /dca QQQ 10:15 15:25")
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    cfg = u["alerts"].setdefault(ticker, {})
-    cfg["dca"] = dca_str
-    save_data(data)
-    await update.message.reply_text(f"🧠 DCA guardado {ticker}: {dca_str}")
-
-
-async def setbudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /setbudget WEEKLY DIP   (ej: /setbudget 70 40)")
-    weekly = safe_float(context.args[0])
-    dip = safe_float(context.args[1])
-    if weekly is None or dip is None or weekly <= 0 or dip < 0:
-        return await update.message.reply_text("Valores inválidos.")
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    u["weekly_budget"] = float(weekly)
-    u["dip_budget"] = float(dip)
-    ensure_week_reset(u)
-    save_data(data)
-    await update.message.reply_text(f"💰 Presupuesto guardado: ${weekly:.0f}/semana + ${dip:.0f} dips.")
-
-
-async def plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2 or len(context.args) % 2 != 0:
-        return await update.message.reply_text("Uso: /plan TICKER AMT TICKER AMT ...")
-    pairs = context.args
-    plan_map: Dict[str, float] = {}
-    for i in range(0, len(pairs), 2):
-        tkr = pairs[i].upper().strip()
-        amt = safe_float(pairs[i + 1])
-        if amt is None or amt <= 0:
-            return await update.message.reply_text(f"Monto inválido para {tkr}")
-        plan_map[tkr] = float(amt)
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    u["weekly_plan"] = plan_map
-    save_data(data)
-    await update.message.reply_text("✅ Plan lunes guardado. Usa /monday para verlo.")
-
-
-async def monday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    ensure_week_reset(u)
-    save_data(data)
-
-    plan_map = u.get("weekly_plan", {})
-    weekly = float(u.get("weekly_budget", 70))
-    dip = float(u.get("dip_budget", 40))
-
-    if not plan_map:
-        return await update.message.reply_text("No tienes plan. Ej: /plan QQQ 30 SCHD 20 JEPQ 20")
-
-    total = sum(plan_map.values())
-    lines = ["📆 Plan fijo de lunes (manual):"]
-    for tkr, amt in plan_map.items():
-        lines.append(f"• {tkr}: ${amt:.0f}")
-    lines.append(f"\nTotal plan: ${total:.0f} (tu semanal: ${weekly:.0f})")
-    if abs(total - weekly) > 0.01:
-        lines.append("⚠️ Tu plan no suma exactamente tu presupuesto semanal.")
-    lines.append(f"\n📉 Dips (DCA inteligente): ${dip:.0f} por semana (solo si hay caída).")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    ensure_week_reset(u)
-    save_data(data)
-
-    alerts = u.get("alerts", {})
-    if not alerts:
-        return await update.message.reply_text("No tienes alertas. Usa /add QQQ 10")
-
-    ws = u.get("week_state", {})
-    dip_budget = float(u.get("dip_budget", 40))
-    weekly_budget = float(u.get("weekly_budget", 70))
-    dip_spent = float(ws.get("dip_spent", 0))
-    weekly_spent = float(ws.get("weekly_spent", 0))
-
-    lines = ["📌 Tus alertas:"]
-    for tkr, cfg in alerts.items():
-        buy = cfg.get("buy_drop_pct", None)
-        entryv = cfg.get("entry", None)
-        tp = cfg.get("tp", 0)
-        sl = cfg.get("sl", 0)
-        dca_str = cfg.get("dca", "")
-        lines.append(f"\n🔹 {tkr}")
-        if buy:
-            lines.append(f"  BUY ≥ {buy}%")
-        lines.append(f"  Entry: {entryv}")
-        if tp and sl:
-            lines.append(f"  TP: {tp}% / SL: {sl}%")
-        lines.append(f"  DCA: {dca_str if dca_str else 'OFF'}")
-
-    lines.append(f"\n💰 Weekly usado: ${weekly_spent:.0f}/${weekly_budget:.0f}")
-    lines.append(f"💰 Dips usado: ${dip_spent:.0f}/${dip_budget:.0f}")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        return await update.message.reply_text("Uso: /show TICKER")
-    ticker = context.args[0].upper().strip()
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    ensure_week_reset(u)
-    save_data(data)
-
-    cfg = u.get("alerts", {}).get(ticker)
-    if not cfg:
-        return await update.message.reply_text("Ese ticker no está configurado. Usa /add TICKER %")
-
-    lines = [ticker]
-    lines.append(f"BUY ≥ {cfg.get('buy_drop_pct', 'None')}%")
-    lines.append(f"Entry: {cfg.get('entry', 'None')}")
-    lines.append(f"TP: {cfg.get('tp', 'None')}%")
-    lines.append(f"SL: {cfg.get('sl', 'None')}%")
-
-    dca_str = cfg.get("dca", "")
-    if dca_str:
-        lines.append("DCA:")
-        for d, a in parse_dca(dca_str):
-            lines.append(f"  ≥{d:.1f}% → ${a:.0f}")
-    else:
-        lines.append("DCA: OFF")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        return await update.message.reply_text("Uso: /remove TICKER")
-    ticker = context.args[0].upper().strip()
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    if ticker in u["alerts"]:
-        del u["alerts"][ticker]
-        save_data(data)
-        return await update.message.reply_text(f"🗑️ Eliminado: {ticker}")
-
-    await update.message.reply_text("Ese ticker no estaba en tu lista.")
-
-
-async def score(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        return await update.message.reply_text("Uso: /score TICKER")
-    ticker = context.args[0].upper().strip()
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    save_data(data)
-
-    if not premium_active(u):
-        return await update.message.reply_text("🔒 Score es Premium/Trial. Usa /premium")
-
-    s = fetch_snapshot(ticker)
-    if not s:
-        return await update.message.reply_text("No pude obtener datos ahora. Intenta luego.")
-
-    sc = opportunity_score(s)
-    lines = [
-        f"📊 {ticker} Opportunity Score: {sc:.1f}/10",
-        f"Precio: ${s.price:.2f}",
-        f"Caída desde máx 60d: {s.drop_pct:.1f}% (máx: ${s.recent_high:.2f})",
-    ]
-    if s.rsi14 is not None:
-        lines.append(f"RSI(14): {s.rsi14:.1f}")
-    if s.sma50 is not None:
-        lines.append(f"SMA50: {s.sma50:.2f}")
-    if s.sma200 is not None:
-        lines.append(f"SMA200: {s.sma200:.2f}")
-    if s.vol_ratio is not None:
-        lines.append(f"Vol vs avg20: {s.vol_ratio:.2f}x")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def cashflow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    save_data(data)
-
-    if not premium_active(u):
-        return await update.message.reply_text("🔒 Cashflow planner es Premium/Trial. Usa /premium")
-
-    tickers = [a.upper().strip() for a in context.args] if context.args else ["JEPQ", "SCHD"]
-
-    lines = ["💵 Cash Flow Planner (estimado por $1,000 invertidos)"]
-    for tkr in tickers:
-        t = yf.Ticker(tkr)
-        info = {}
-        try:
-            info = t.info or {}
-        except Exception:
-            info = {}
-
-        dy = safe_float(info.get("dividendYield", None))
-        if dy is None or dy <= 0:
-            lines.append(f"\n• {tkr}: (sin datos de dividendos ahora)")
-            continue
-
-        annual_cash = 1000.0 * dy
-        monthly_cash = annual_cash / 12.0
-        lines.append(
-            f"\n• {tkr}: yield aprox {dy*100:.2f}%"
-            f"\n  ≈ ${monthly_cash:.2f}/mes por cada $1,000"
-            f"\n  ≈ ${annual_cash:.2f}/año por cada $1,000"
-        )
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def copy_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        return await update.message.reply_text("Uso: /copy aggressive | income | conservative")
-
-    name = context.args[0].lower().strip()
-
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-
-    if not premium_active(u):
-        return await update.message.reply_text("🔒 Copy strategies es Premium/Trial. Usa /premium")
-
-    if name == "aggressive":
-        u["alerts"]["QQQ"] = {"buy_drop_pct": 10, "entry": None, "tp": 10, "sl": 7, "dca": "10:15 15:25", "last_sent_ts": 0, "last_dca_sent_week": 0}
-        u["alerts"]["NVDA"] = {"buy_drop_pct": 15, "entry": None, "tp": 20, "sl": 10, "dca": "10:10 15:15 20:15", "last_sent_ts": 0, "last_dca_sent_week": 0}
-        u["alerts"]["MSFT"] = {"buy_drop_pct": 12, "entry": None, "tp": 15, "sl": 8, "dca": "12:20", "last_sent_ts": 0, "last_dca_sent_week": 0}
-        u["weekly_plan"] = {"QQQ": 30, "SCHD": 20, "JEPQ": 20}
-        u["weekly_budget"] = 70
-        u["dip_budget"] = 40
-        msg = "✅ Copy aplicado: AGGRESSIVE."
-    elif name == "income":
-        u["alerts"].clear()
-        u["alerts"]["QQQ"] = {"buy_drop_pct": 12, "entry": None, "tp": 10, "sl": 7, "dca": "12:20", "last_sent_ts": 0, "last_dca_sent_week": 0}
-        u["weekly_plan"] = {"JEPQ": 35, "SCHD": 25, "QQQ": 10}
-        u["weekly_budget"] = 70
-        u["dip_budget"] = 40
-        msg = "✅ Copy aplicado: INCOME."
-    elif name == "conservative":
-        u["alerts"].clear()
-        u["alerts"]["QQQ"] = {"buy_drop_pct": 12, "entry": None, "tp": 8, "sl": 6, "dca": "12:20 18:20", "last_sent_ts": 0, "last_dca_sent_week": 0}
-        u["weekly_plan"] = {"QQQ": 25, "SCHD": 25, "JEPQ": 20}
-        u["weekly_budget"] = 70
-        u["dip_budget"] = 40
-        msg = "✅ Copy aplicado: CONSERVATIVE."
-    else:
-        return await update.message.reply_text("Estrategia no válida: aggressive | income | conservative")
-
-    ensure_week_reset(u)
-    save_data(data)
-    await update.message.reply_text(msg + " Usa /list para ver todo.")
-
-
-async def bought(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /bought dips NVDA 15
-    /bought weekly QQQ 30
-    /bought status
-    /bought reset
-    """
-    data = load_data()
-    u = get_user(data, str(update.effective_chat.id))
-    ensure_trial(u)
-    ensure_week_reset(u)
-
-    ws = u.get("week_state", {})
-    weekly_budget = float(u.get("weekly_budget", 70))
-    dip_budget = float(u.get("dip_budget", 40))
-    weekly_spent = float(ws.get("weekly_spent", 0))
-    dip_spent = float(ws.get("dip_spent", 0))
-
-    if len(context.args) < 1:
-        return await update.message.reply_text(
-            "Uso:\n"
-            "• /bought dips TICKER AMT\n"
-            "• /bought weekly TICKER AMT\n"
-            "• /bought status\n"
-            "• /bought reset"
-        )
-
-    mode = context.args[0].lower().strip()
-
-    if mode == "status":
-        return await update.message.reply_text(
-            f"📊 Presupuesto semanal:\n"
-            f"• Weekly: ${weekly_spent:.0f}/${weekly_budget:.0f}\n"
-            f"• Dips: ${dip_spent:.0f}/${dip_budget:.0f}"
-        )
-
-    if mode == "reset":
-        ws["weekly_spent"] = 0
-        ws["dip_spent"] = 0
-        u["week_state"] = ws
-        save_data(data)
-        return await update.message.reply_text("✅ Contadores reseteados para esta semana (weekly y dips).")
-
-    if mode not in ("weekly", "dips"):
-        return await update.message.reply_text("Modo inválido. Usa: weekly | dips | status | reset")
+async def cmd_setsell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
 
     if len(context.args) < 3:
-        return await update.message.reply_text("Uso: /bought weekly QQQ 30  ó  /bought dips NVDA 15")
+        return await update.message.reply_text("Uso: /setsell TICKER TP% SL%\nEj: /setsell QQQ 10 7")
 
-    ticker = context.args[1].upper().strip()
-    try:
-        amt = float(context.args[2])
-        if amt <= 0:
-            raise ValueError()
-    except Exception:
-        return await update.message.reply_text("Monto inválido. Ej: /bought dips NVDA 15")
+    ticker = normalize_ticker(context.args[0])
+    tp = float(context.args[1])
+    sl = float(context.args[2])
 
-    if mode == "weekly":
-        ws["weekly_spent"] = float(ws.get("weekly_spent", 0)) + amt
-        remaining = max(0.0, weekly_budget - float(ws["weekly_spent"]))
-        save_data(data)
-        return await update.message.reply_text(
-            f"✅ Registrado WEEKLY: {ticker} ${amt:.0f}\n"
-            f"Weekly usado: ${ws['weekly_spent']:.0f}/${weekly_budget:.0f} | restante: ${remaining:.0f}"
-        )
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO alerts (telegram_id, ticker, tp_pct, sl_pct)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (telegram_id, ticker)
+            DO UPDATE SET tp_pct = EXCLUDED.tp_pct, sl_pct = EXCLUDED.sl_pct;
+            """, (tg_id, ticker, tp, sl))
+            conn.commit()
 
-    ws["dip_spent"] = float(ws.get("dip_spent", 0)) + amt
-    remaining = max(0.0, dip_budget - float(ws["dip_spent"]))
-    save_data(data)
-    return await update.message.reply_text(
-        f"✅ Registrado DIPS: {ticker} ${amt:.0f}\n"
-        f"Dips usado: ${ws['dip_spent']:.0f}/${dip_budget:.0f} | restante: ${remaining:.0f}"
-    )
+    await update.message.reply_text(f"🧾 {ticker} TP={tp:.1f}% | SL={sl:.1f}% (solo alerta)")
 
 
-# ----------------------------
-# Background checker
-# ----------------------------
-async def check_job(context: ContextTypes.DEFAULT_TYPE):
+async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    if len(context.args) < 2:
+        return await update.message.reply_text("Uso: /dca TICKER 10:15 15:25 20:40\nEj: /dca QQQ 10:15 15:25")
+
+    ticker = normalize_ticker(context.args[0])
+    rules = parse_dca_rules(context.args[1:])
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO alerts (telegram_id, ticker, dca_rules)
+            VALUES (%s, %s, %s::jsonb)
+            ON CONFLICT (telegram_id, ticker)
+            DO UPDATE SET dca_rules = EXCLUDED.dca_rules;
+            """, (tg_id, ticker, json.dumps(rules)))
+            conn.commit()
+
+    await update.message.reply_text(f"🧠 DCA guardado para {ticker}: {', '.join(context.args[1:])}")
+
+
+async def cmd_setbudget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    if len(context.args) < 2:
+        return await update.message.reply_text("Uso: /setbudget WEEKLY DIPS\nEj: /setbudget 70 40")
+
+    weekly = float(context.args[0])
+    dips = float(context.args[1])
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO budgets (telegram_id, weekly_budget, dips_budget, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET weekly_budget=EXCLUDED.weekly_budget, dips_budget=EXCLUDED.dips_budget, updated_at=NOW();
+            """, (tg_id, weekly, dips))
+            conn.commit()
+
+    await update.message.reply_text(f"💰 Budget guardado: semanal=${weekly:.2f} | dips=${dips:.2f}")
+
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    if len(context.args) < 2 or len(context.args) % 2 != 0:
+        return await update.message.reply_text("Uso: /plan TICKER AMOUNT TICKER AMOUNT...\nEj: /plan QQQ 30 SCHD 20 JEPQ 20")
+
+    pairs = []
+    for i in range(0, len(context.args), 2):
+        t = normalize_ticker(context.args[i])
+        amt = float(context.args[i+1])
+        pairs.append((t, amt))
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM plans WHERE telegram_id=%s;", (tg_id,))
+            for t, amt in pairs:
+                cur.execute("""
+                INSERT INTO plans (telegram_id, ticker, amount)
+                VALUES (%s, %s, %s);
+                """, (tg_id, t, amt))
+            conn.commit()
+
+    pretty = " | ".join([f"{t} ${amt:.2f}" for t, amt in pairs])
+    await update.message.reply_text(f"📅 Plan lunes guardado: {pretty}")
+
+
+async def cmd_monday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update)
+    tg_id = update.effective_user.id
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT weekly_budget, dips_budget FROM budgets WHERE telegram_id=%s;", (tg_id,))
+            b = cur.fetchone()
+            cur.execute("SELECT ticker, amount FROM plans WHERE telegram_id=%s ORDER BY ticker;", (tg_id,))
+            p = cur.fetchall()
+
+    weekly = float(b["weekly_budget"]) if b else 0.0
+    dips = float(b["dips_budget"]) if b else 0.0
+
+    if not p:
+        return await update.message.reply_text("No tienes plan. Crea uno con /plan QQQ 30 SCHD 20 JEPQ 20")
+
+    total = sum(float(x["amount"]) for x in p)
+    lines = [
+        "📅 Plan de compra (Lunes):",
+        *[f"• {x['ticker']}: ${float(x['amount']):.2f}" for x in p],
+        f"\nTotal plan: ${total:.2f}",
+        f"Budget semanal: ${weekly:.2f}",
+        f"Budget dips: ${dips:.2f}",
+    ]
+    if weekly > 0 and total > weekly + 1e-9:
+        lines.append("⚠️ Tu plan está por encima del budget semanal. Ajusta /plan o /setbudget.")
+    await update.message.reply_text("\n".join(lines))
+
+
+# =========================
+# BACKGROUND CHECKER
+# =========================
+BUY_COOLDOWN = timedelta(hours=6)
+TP_SL_COOLDOWN = timedelta(hours=3)
+
+async def check_jobs(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs periodically. Checks all alerts for all users.
+    Sends:
+      - BUY alert when drop >= drop_pct
+      - TP/SL alerts when entry_price defined and target hit
+      - DCA suggestion (if rules exist)
+    """
     app = context.application
-    data = load_data()
+    now = now_utc()
 
-    for chat_id, u in data.get("users", {}).items():
-        ensure_week_reset(u)
+    # Load budgets into dict
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT telegram_id, weekly_budget, dips_budget FROM budgets;")
+            budget_rows = cur.fetchall() or []
+            budgets = {r["telegram_id"]: r for r in budget_rows}
 
-        alerts = u.get("alerts", {})
-        if not alerts:
+            cur.execute("""
+            SELECT
+              id, telegram_id, ticker, drop_pct, entry_price, tp_pct, sl_pct, dca_rules,
+              last_buy_alert_at, last_tp_alert_at, last_sl_alert_at, last_buy_drop_sent
+            FROM alerts;
+            """)
+            alerts = cur.fetchall() or []
+
+    # Group by ticker to reduce yfinance calls
+    tickers = sorted({a["ticker"] for a in alerts})
+    prices = {}
+
+    # fetch prices in thread to avoid blocking event loop too hard
+    def fetch_all():
+        out = {}
+        for t in tickers:
+            curp, high60 = fetch_price_and_60d_high(t)
+            out[t] = (curp, high60)
+        return out
+
+    loop = asyncio.get_running_loop()
+    prices = await loop.run_in_executor(None, fetch_all)
+
+    # Process each alert
+    for a in alerts:
+        tg_id = a["telegram_id"]
+        ticker = a["ticker"]
+        current, high60 = prices.get(ticker, (None, None))
+        if current is None or high60 is None or high60 <= 0:
             continue
 
-        cooldown_sec = int(u.get("cooldown_min", 360)) * 60
-        ws = u.get("week_state", {})
-        dip_budget = float(u.get("dip_budget", 40))
-        dip_spent = float(ws.get("dip_spent", 0))
-        remaining_dips = max(0.0, dip_budget - dip_spent)
+        drop_pct = (high60 - current) / high60 * 100.0
 
-        for ticker, cfg in list(alerts.items()):
-            buy_drop = float(cfg.get("buy_drop_pct", 0) or 0)
-            last_sent = int(cfg.get("last_sent_ts", 0) or 0)
+        dips_budget = float(budgets.get(tg_id, {}).get("dips_budget", 0) or 0)
 
-            # cooldown per ticker
-            if now_ts() - last_sent < cooldown_sec:
-                continue
+        # ---------- BUY drop alert ----------
+        if a["drop_pct"] is not None:
+            threshold = float(a["drop_pct"])
+            last_at = a["last_buy_alert_at"]
+            last_sent_drop = a["last_buy_drop_sent"]
 
-            s = fetch_snapshot(ticker)
-            if not s:
-                continue
+            cooldown_ok = (last_at is None) or ((now - last_at) >= BUY_COOLDOWN)
+            deeper_drop = (last_sent_drop is None) or (drop_pct >= float(last_sent_drop) + 2.0)
 
-            if buy_drop > 0 and s.drop_pct >= buy_drop:
-                base_text = (
+            if drop_pct >= threshold and (cooldown_ok or deeper_drop):
+                # DCA suggestion
+                dca_rules = a["dca_rules"] or []
+                suggested = dca_suggest_amount(dca_rules, drop_pct, dips_budget)
+
+                msg = (
                     f"📉 ALERTA: {ticker}\n"
-                    f"Caída: {s.drop_pct:.1f}% desde el máximo 60d\n"
-                    f"Precio aprox: ${s.price:.2f}\n"
-                    f"Máximo 60d: ${s.recent_high:.2f}"
+                    f"Caída: {drop_pct:.1f}% desde el máximo 60d\n"
+                    f"Precio aprox: ${current:.2f}\n"
+                    f"Máximo 60d: ${high60:.2f}\n"
                 )
+                if suggested:
+                    msg += f"\n🧠 DCA sugerido (según tu regla): ${suggested:.2f}"
+                else:
+                    msg += "\n🧠 DCA: (sin regla o no aplica todavía)"
 
-                extra = ""
-                if premium_active(u):
-                    sc = opportunity_score(s)
-                    extra_lines = [f"\n📊 Score: {sc:.1f}/10"]
-                    if s.rsi14 is not None:
-                        extra_lines.append(f"RSI: {s.rsi14:.1f}")
-                    if s.sma50 is not None:
-                        extra_lines.append(f"SMA50: {s.sma50:.2f}")
-                    if s.sma200 is not None:
-                        extra_lines.append(f"SMA200: {s.sma200:.2f}")
-                    if s.vol_ratio is not None:
-                        extra_lines.append(f"Vol ratio: {s.vol_ratio:.2f}x")
-                    extra = "\n" + "\n".join(extra_lines)
+                msg += "\n\n👉 Si vas a comprar, dime cuánto quieres meter y te digo cómo repartirlo."
 
-                # DCA suggestion (uses remaining dips; user confirms with /bought)
-                dca_note = ""
-                dca_str = cfg.get("dca", "") or ""
-                tiers = parse_dca(dca_str) if dca_str else []
-                suggested = dca_suggestion(s.drop_pct, tiers) if tiers else None
+                try:
+                    await app.bot.send_message(chat_id=tg_id, text=msg)
+                except:
+                    pass
 
-                current_week = int(ws.get("week_monday_ts", 0))
-                last_week_sent = int(cfg.get("last_dca_sent_week", 0) or 0)
+                # update spam control
+                with db_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                        UPDATE alerts
+                        SET last_buy_alert_at=%s, last_buy_drop_sent=%s
+                        WHERE id=%s;
+                        """, (now, drop_pct, a["id"]))
+                        conn.commit()
 
-                if suggested is not None and remaining_dips > 0 and current_week != last_week_sent:
-                    buy_amt = min(float(suggested), remaining_dips)
-                    if buy_amt > 0:
-                        dca_note = (
-                            f"\n\n🧠 DCA sugerido (dips): ${buy_amt:.0f} "
-                            f"(restante dips: ${remaining_dips:.0f}/${dip_budget:.0f})"
-                            f"\n✅ Confirma si compras: /bought dips {ticker} {int(buy_amt)}"
+        # ---------- TP/SL alerts ----------
+        entry = a["entry_price"]
+        if entry is not None and (a["tp_pct"] is not None or a["sl_pct"] is not None):
+            entry = float(entry)
+            if entry > 0:
+                # TP
+                if a["tp_pct"] is not None:
+                    tp = float(a["tp_pct"])
+                    tp_price = entry * (1.0 + tp / 100.0)
+                    last_tp = a["last_tp_alert_at"]
+                    if current >= tp_price and ((last_tp is None) or ((now - last_tp) >= TP_SL_COOLDOWN)):
+                        msg = (
+                            f"✅ TP ALERTA: {ticker}\n"
+                            f"Entry: ${entry:.2f}\n"
+                            f"TP: {tp:.1f}% → objetivo ${tp_price:.2f}\n"
+                            f"Precio actual: ${current:.2f}\n\n"
+                            "⚠️ Solo alerta. Tú decides vender."
                         )
-                        cfg["last_dca_sent_week"] = current_week
-                elif remaining_dips <= 0:
-                    dca_note = f"\n\n⚠️ Dips semanal agotado: ${dip_spent:.0f}/${dip_budget:.0f}"
+                        try:
+                            await app.bot.send_message(chat_id=tg_id, text=msg)
+                        except:
+                            pass
+                        with db_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE alerts SET last_tp_alert_at=%s WHERE id=%s;", (now, a["id"]))
+                                conn.commit()
 
-                cfg["last_sent_ts"] = now_ts()
-                alerts[ticker] = cfg
-
-                await app.bot.send_message(
-                    chat_id=int(chat_id),
-                    text=base_text + extra + dca_note
-                )
-
-    save_data(data)
-
-
-def build_app() -> Application:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno (Render).")
-
-    app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("premium", premium))
-    app.add_handler(CommandHandler("grantpremium", grantpremium))
-
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(CommandHandler("setsell", setsell))
-    app.add_handler(CommandHandler("entry", entry))
-    app.add_handler(CommandHandler("dca", dca))
-
-    app.add_handler(CommandHandler("setbudget", setbudget))
-    app.add_handler(CommandHandler("plan", plan))
-    app.add_handler(CommandHandler("monday", monday))
-
-    app.add_handler(CommandHandler("list", list_alerts))
-    app.add_handler(CommandHandler("show", show))
-    app.add_handler(CommandHandler("remove", remove))
-
-    app.add_handler(CommandHandler("score", score))
-    app.add_handler(CommandHandler("cashflow", cashflow))
-    app.add_handler(CommandHandler("copy", copy_strategy))
-
-    # NEW:
-    app.add_handler(CommandHandler("bought", bought))
-
-    # Checker every 5 minutes
-    app.job_queue.run_repeating(check_job, interval=5 * 60, first=15)
-
-    return app
+                # SL
+                if a["sl_pct"] is not None:
+                    sl = float(a["sl_pct"])
+                    sl_price = entry * (1.0 - sl / 100.0)
+                    last_sl = a["last_sl_alert_at"]
+                    if current <= sl_price and ((last_sl is None) or ((now - last_sl) >= TP_SL_COOLDOWN)):
+                        msg = (
+                            f"🛑 SL ALERTA: {ticker}\n"
+                            f"Entry: ${entry:.2f}\n"
+                            f"SL: {sl:.1f}% → nivel ${sl_price:.2f}\n"
+                            f"Precio actual: ${current:.2f}\n\n"
+                            "⚠️ Solo alerta. Tú decides qué hacer."
+                        )
+                        try:
+                            await app.bot.send_message(chat_id=tg_id, text=msg)
+                        except:
+                            pass
+                        with db_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE alerts SET last_sl_alert_at=%s WHERE id=%s;", (now, a["id"]))
+                                conn.commit()
 
 
+# =========================
+# MAIN
+# =========================
 def main():
-    app = build_app()
-    # keep only 1 instance running in Render to avoid Conflict getUpdates
-    app.run_polling(drop_pending_updates=True)
+    if not BOT_TOKEN:
+        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en Render (Environment Variables).")
+
+    db_init()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("show", cmd_show))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("setsell", cmd_setsell))
+    app.add_handler(CommandHandler("dca", cmd_dca))
+    app.add_handler(CommandHandler("setbudget", cmd_setbudget))
+    app.add_handler(CommandHandler("plan", cmd_plan))
+    app.add_handler(CommandHandler("monday", cmd_monday))
+
+    # Job queue: cada 5 minutos (puedes cambiar a 300, 600, etc.)
+    app.job_queue.run_repeating(check_jobs, interval=300, first=15)
+
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
